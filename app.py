@@ -6,83 +6,63 @@ app = Flask(__name__)
 
 
 @app.route("/events", methods=["POST"])
-def ingest_event():
-    """
-    Accept a new event and queue it for delivery.
-    Body: { type, payload, webhook_url }
-    """
+def create_event():
     data = request.get_json()
 
-    if not data:
-        return jsonify({"error": "Request body must be JSON"}), 400
+    # basic validation
+    if data is None:
+        return jsonify({"error": "send json data"}), 400
 
-    # Validate required fields
-    missing = [f for f in ["type", "payload", "webhook_url"] if f not in data]
-    if missing:
-        return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+    if "type" not in data:
+        return jsonify({"error": "type is required"}), 400
 
-    event = database.create_event(
-        event_type=data["type"],
-        payload=data["payload"],
-        webhook_url=data["webhook_url"]
-    )
+    if "payload" not in data:
+        return jsonify({"error": "payload is required"}), 400
 
-    return jsonify(event), 201
+    if "webhook_url" not in data:
+        return jsonify({"error": "webhook_url is required"}), 400
+
+    e = database.add_event(data["type"], data["payload"], data["webhook_url"])
+    return jsonify(e), 201
 
 
 @app.route("/events", methods=["GET"])
 def list_events():
-    """Return all events (without full attempt history for brevity)."""
-    events = database.get_all_events()
+    events = database.get_all()
     return jsonify(events), 200
 
 
-@app.route("/events/<event_id>", methods=["GET"])
-def get_event(event_id):
-    """Return a single event with its full attempt history."""
-    event = database.get_event_by_id(event_id)
+@app.route("/events/<id>", methods=["GET"])
+def get_event(id):
+    e = database.get_event(id)
 
-    if event is None:
-        return jsonify({"error": "Event not found"}), 404
+    if e is None:
+        return jsonify({"error": "event not found"}), 404
 
-    return jsonify(event), 200
+    return jsonify(e), 200
 
 
-@app.route("/events/<event_id>/retry", methods=["POST"])
-def retry_event(event_id):
-    """
-    Manually re-queue a dead event for redelivery.
-    Returns 400 if the event is not in dead status.
-    """
-    event = database.get_event_by_id(event_id)
+@app.route("/events/<id>/retry", methods=["POST"])
+def retry_event(id):
+    e = database.get_event(id)
 
-    if event is None:
-        return jsonify({"error": "Event not found"}), 404
+    if e is None:
+        return jsonify({"error": "not found"}), 404
 
-    if event["status"] != "dead":
-        return jsonify({
-            "error": "Only dead events can be manually retried",
-            "current_status": event["status"]
-        }), 400
+    # only dead events can be retried
+    if e["status"] != "dead":
+        return jsonify({"error": "event is not dead, cannot retry"}), 400
 
-    requeued = database.requeue_dead_event(event_id)
+    done = database.requeue(id)
 
-    if requeued:
-        updated_event = database.get_event_by_id(event_id)
-        return jsonify({
-            "message": "Event re-queued for delivery",
-            "event": updated_event
-        }), 200
-
-    return jsonify({"error": "Could not re-queue event"}), 500
+    if done:
+        return jsonify({"message": "ok event requeued", "event": database.get_event(id)}), 200
+    else:
+        return jsonify({"error": "something went wrong"}), 500
 
 
 if __name__ == "__main__":
-    # Initialize database tables
     database.init_db()
-
-    # Start background delivery worker
-    worker.start_worker_thread()
-
-    print("[App] Starting webhook delivery engine...")
+    worker.start()
+    print("starting server...")
     app.run(host="0.0.0.0", port=5000, debug=False)

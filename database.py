@@ -1,201 +1,174 @@
 import sqlite3
-import json
 import uuid
+import json
 from datetime import datetime
-from config import DATABASE_PATH
+from config import DB
 
 
-def get_connection():
-    """Create and return a new database connection."""
-    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row  # allows dict-like access to rows
-    return conn
+# connecting to db
+def connect():
+    con = sqlite3.connect(DB, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
 
 
+# creating tables if not exist
 def init_db():
-    """Create tables if they don't exist."""
-    conn = get_connection()
-    cursor = conn.cursor()
+    con = connect()
+    cur = con.cursor()
 
-    cursor.execute("""
+    # events table
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS events (
-            id TEXT PRIMARY KEY,
-            type TEXT NOT NULL,
-            payload TEXT NOT NULL,
-            webhook_url TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL,
+            id TEXT,
+            type TEXT,
+            payload TEXT,
+            webhook_url TEXT,
+            status TEXT,
+            created_at TEXT,
             next_attempt_at TEXT
         )
     """)
 
-    cursor.execute("""
+    # attempts table
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS attempts (
-            id TEXT PRIMARY KEY,
-            event_id TEXT NOT NULL,
-            attempted_at TEXT NOT NULL,
+            id TEXT,
+            event_id TEXT,
+            attempted_at TEXT,
             http_status INTEGER,
-            outcome TEXT NOT NULL,
-            FOREIGN KEY (event_id) REFERENCES events(id)
+            outcome TEXT
         )
     """)
 
-    conn.commit()
-    conn.close()
+    con.commit()
+    con.close()
+    print("db initialized")
 
 
-def create_event(event_type, payload, webhook_url):
-    """Insert a new event into the database and return it."""
-    event_id = str(uuid.uuid4())
-    created_at = datetime.utcnow().isoformat()
+def add_event(type, payload, url):
+    id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
 
-    conn = get_connection()
-    cursor = conn.cursor()
+    con = connect()
+    cur = con.cursor()
+    cur.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?)",
+                (id, type, json.dumps(payload), url, "pending", now, now))
+    con.commit()
+    con.close()
 
-    cursor.execute("""
-        INSERT INTO events (id, type, payload, webhook_url, status, created_at, next_attempt_at)
-        VALUES (?, ?, ?, ?, 'pending', ?, ?)
-    """, (event_id, event_type, json.dumps(payload), webhook_url, created_at, created_at))
-
-    conn.commit()
-    conn.close()
-
-    return get_event_by_id(event_id)
+    # return the event we just created
+    return get_event(id)
 
 
-def get_all_events():
-    """Return all events with their attempts."""
-    conn = get_connection()
-    cursor = conn.cursor()
+def get_all():
+    con = connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM events")
+    rows = cur.fetchall()
+    con.close()
 
-    cursor.execute("SELECT * FROM events ORDER BY created_at DESC")
-    rows = cursor.fetchall()
-    conn.close()
+    result = []
+    for r in rows:
+        result.append(make_event_dict(r))
+    return result
 
-    return [_format_event(row) for row in rows]
 
+def get_event(id):
+    con = connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM events WHERE id=?", (id,))
+    row = cur.fetchone()
 
-def get_event_by_id(event_id):
-    """Return a single event with its full attempts history."""
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT * FROM events WHERE id = ?", (event_id,))
-    row = cursor.fetchone()
-
-    if row is None:
-        conn.close()
+    if row == None:
+        con.close()
         return None
 
-    event = _format_event(row)
+    event = make_event_dict(row)
 
-    cursor.execute(
-        "SELECT * FROM attempts WHERE event_id = ? ORDER BY attempted_at ASC",
-        (event_id,)
-    )
-    attempt_rows = cursor.fetchall()
-    conn.close()
+    # also get attempts
+    cur.execute("SELECT * FROM attempts WHERE event_id=?", (id,))
+    attempts = cur.fetchall()
+    con.close()
 
-    event["attempts"] = [
-        {
+    alist = []
+    for a in attempts:
+        alist.append({
             "attempted_at": a["attempted_at"],
             "http_status": a["http_status"],
             "outcome": a["outcome"]
-        }
-        for a in attempt_rows
-    ]
+        })
+    event["attempts"] = alist
 
     return event
 
 
-def get_pending_events_due_now():
-    """Return all pending/failed events whose next_attempt_at is due."""
+# get events that need to be delivered now
+def get_due_events():
     now = datetime.utcnow().isoformat()
-    conn = get_connection()
-    cursor = conn.cursor()
+    con = connect()
+    cur = con.cursor()
+    cur.execute("SELECT * FROM events WHERE status=? OR status=?", ("pending", "failed"))
+    rows = cur.fetchall()
+    con.close()
 
-    cursor.execute("""
-        SELECT * FROM events
-        WHERE status IN ('pending', 'failed')
-        AND next_attempt_at <= ?
-    """, (now,))
-    rows = cursor.fetchall()
-    conn.close()
-
-    return [_format_event(row) for row in rows]
-
-
-def log_attempt(event_id, http_status, outcome):
-    """Record a delivery attempt for an event."""
-    attempt_id = str(uuid.uuid4())
-    attempted_at = datetime.utcnow().isoformat()
-
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO attempts (id, event_id, attempted_at, http_status, outcome)
-        VALUES (?, ?, ?, ?, ?)
-    """, (attempt_id, event_id, attempted_at, http_status, outcome))
-
-    conn.commit()
-    conn.close()
+    due = []
+    for r in rows:
+        if r["next_attempt_at"] <= now:
+            due.append(make_event_dict(r))
+    return due
 
 
-def update_event_status(event_id, status, next_attempt_at=None):
-    """Update the status and optionally the next retry time of an event."""
-    conn = get_connection()
-    cursor = conn.cursor()
+def save_attempt(event_id, http_status, outcome):
+    id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+    con = connect()
+    cur = con.cursor()
+    cur.execute("INSERT INTO attempts VALUES (?,?,?,?,?)",
+                (id, event_id, now, http_status, outcome))
+    con.commit()
+    con.close()
 
-    cursor.execute("""
-        UPDATE events
-        SET status = ?, next_attempt_at = ?
-        WHERE id = ?
-    """, (status, next_attempt_at, event_id))
 
-    conn.commit()
-    conn.close()
+def update_status(event_id, status, next_time=None):
+    con = connect()
+    cur = con.cursor()
+    cur.execute("UPDATE events SET status=?, next_attempt_at=? WHERE id=?",
+                (status, next_time, event_id))
+    con.commit()
+    con.close()
 
 
 def count_attempts(event_id):
-    """Return the number of attempts made for an event."""
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT COUNT(*) FROM attempts WHERE event_id = ?", (event_id,))
-    count = cursor.fetchone()[0]
-    conn.close()
-
-    return count
+    con = connect()
+    cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM attempts WHERE event_id=?", (event_id,))
+    c = cur.fetchone()[0]
+    con.close()
+    return c
 
 
-def requeue_dead_event(event_id):
-    """Reset a dead event back to pending so the worker picks it up."""
+def requeue(event_id):
+    con = connect()
+    cur = con.cursor()
     now = datetime.utcnow().isoformat()
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        UPDATE events
-        SET status = 'pending', next_attempt_at = ?
-        WHERE id = ? AND status = 'dead'
-    """, (now, event_id))
-
-    updated = cursor.rowcount
-    conn.commit()
-    conn.close()
-
-    return updated > 0
+    cur.execute("UPDATE events SET status='pending', next_attempt_at=? WHERE id=? AND status='dead'",
+                (now, event_id))
+    rows_updated = cur.rowcount
+    con.commit()
+    con.close()
+    if rows_updated > 0:
+        return True
+    return False
 
 
-def _format_event(row):
-    """Convert a database row to a dict."""
+def make_event_dict(r):
     return {
-        "id": row["id"],
-        "type": row["type"],
-        "payload": json.loads(row["payload"]),
-        "webhook_url": row["webhook_url"],
-        "status": row["status"],
-        "created_at": row["created_at"],
+        "id": r["id"],
+        "type": r["type"],
+        "payload": json.loads(r["payload"]),
+        "webhook_url": r["webhook_url"],
+        "status": r["status"],
+        "created_at": r["created_at"],
         "attempts": []
     }
